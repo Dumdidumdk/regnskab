@@ -211,6 +211,14 @@ h3{font-size:1rem;margin:18px 0 4px}
         <div class="full"><label for="nextNo">Næste fakturanummer</label><input type="text" inputmode="numeric" id="nextNo"></div>
       </div>
       <p class="hint">Fakturanumre skal være fortløbende. Har du sendt fakturaer før, så fortsæt fra dit sidste nummer.</p>
+      <h3>Backup</h3>
+      <p class="hint" style="margin-top:0">Regnskab skal gemmes i 5 år. Hent en backup jævnligt, fx hvert kvartal, og gem den et sikkert sted.</p>
+      <div class="btns">
+        <button type="button" class="ghost" id="backupBtn">Hent backup</button>
+        <button type="button" class="ghost" id="restoreBtn">Indlæs backup</button>
+      </div>
+      <input type="file" id="restoreFile" class="sr" accept="application/json,.json" tabindex="-1" aria-hidden="true">
+      <div class="err" id="backupErr" role="alert"></div>
     </details>
   </section>
 
@@ -317,12 +325,28 @@ function render(){
       info.appendChild(r);
     }
     const a = document.createElement("div"); a.className="a num "+e.type;
-    a.textContent = (e.type==="in"?"+":"−") + kr2(e.amount);
+    const neg = (e.type==="out") !== (e.amount<0);
+    a.textContent = (neg?"−":"+") + kr2(Math.abs(e.amount));
+    if(e.invoiceId){
+      // Posteringer fra fakturaer styres under Fakturaer, så nummerrækken bevares
+      const m2=document.createElement("div"); m2.className="m"; m2.textContent="Rettes under Fakturaer";
+      info.appendChild(m2); li.append(info,a,document.createElement("span")); ul.appendChild(li); return;
+    }
     const del = document.createElement("button"); del.className="del"; del.type="button";
     del.textContent="✕"; del.setAttribute("aria-label","Slet "+(e.desc||c.name));
-    del.onclick = ()=>{ if(confirm(e.invoiceId ? "Denne postering hører til en faktura. Slet både posteringen og fakturaen?" : "Slet denne postering?")){ state.entries = state.entries.filter(x=>x.id!==e.id); if(e.invoiceId){ state.invoices=state.invoices.filter(i=>i.id!==e.invoiceId); renderInv(); } save(); render(); if(e.receipt&&assets){ assets.delete(e.receipt).catch(()=>{}); } } };
+    armConfirm(del, "Slet?", ()=>{ state.entries = state.entries.filter(x=>x.id!==e.id); save(); render(); if(e.receipt&&assets){ assets.delete(e.receipt).catch(()=>{}); } });
     li.append(info,a,del); ul.appendChild(li);
   });
+}
+
+// Bekræft ved at trykke to gange (confirm() virker ikke i alle visninger)
+function armConfirm(btn, askText, action){
+  const orig=btn.textContent; let t=null;
+  btn.onclick=()=>{
+    if(btn.dataset.armed){ clearTimeout(t); delete btn.dataset.armed; btn.textContent=orig; action(); return; }
+    btn.dataset.armed="1"; btn.textContent=askText;
+    t=setTimeout(()=>{ delete btn.dataset.armed; btn.textContent=orig; },4000);
+  };
 }
 
 function setType(t, keep){
@@ -507,31 +531,56 @@ function createInv(){
   closeInvForm(); fillYears(new Date(date+"T00:00:00").getFullYear()); save(); render(); renderInv();
 }
 
+function creditInv(orig){
+  const date=today();
+  const cn={ id:uid(), no:state.nextNo, date, due:date, vat:orig.vat, paid:false, credit:orig.no,
+    customer:{...orig.customer}, lines:orig.lines.map(l=>({...l, price:-l.price})) };
+  const t=invTotals(cn);
+  const entry={ id:uid(), type:"in", date, amount:Math.round(t.total*100)/100, cat:cn.vat?"salg":"salg0", desc:`Kreditnota ${cn.no} til faktura ${orig.no}, ${orig.customer.name}`, invoiceId:cn.id };
+  cn.entryId=entry.id; orig.creditedBy=cn.no;
+  state.invoices.push(cn); state.entries.push(entry); state.nextNo++;
+  fillSettings(); fillYears(new Date(date+"T00:00:00").getFullYear()); save(); render(); renderInv();
+}
+
 function renderInv(){
   const ul=$("invList"); ul.innerHTML="";
   const list=[...state.invoices].sort((a,b)=>b.no-a.no);
   const now=today(); let open=0, late=0;
-  list.forEach(inv=>{ if(!inv.paid){ open+=invTotals(inv).total; if(inv.due<now) late++; } });
+  const isOpen=inv=>!inv.paid && !inv.credit && !inv.creditedBy;
+  list.forEach(inv=>{ if(isOpen(inv)){ open+=invTotals(inv).total; if(inv.due<now) late++; } });
   $("invSum").textContent = list.length ? `Ubetalt i alt: ${money(open)} kr.` + (late? `, heraf ${late} ${late===1?"faktura":"fakturaer"} over betalingsfristen` : "") : "";
   if(!list.length){ const li=document.createElement("li"); li.className="empty"; li.textContent="Ingen fakturaer endnu. Tryk Ny faktura for at lave den første."; ul.appendChild(li); return; }
   list.forEach(inv=>{
     const t=invTotals(inv), li=document.createElement("li"); li.className="inv";
     const top=document.createElement("div"); top.className="invtop";
     const left=document.createElement("div");
-    const d=document.createElement("div"); d.className="d"; d.textContent=`Nr. ${inv.no}, ${inv.customer.name}`;
-    const tag=document.createElement("span"); tag.className="tag "+(inv.paid?"paid":(inv.due<now?"late":"open"));
-    tag.textContent=inv.paid?"Betalt":(inv.due<now?"Over frist":"Ubetalt"); d.appendChild(tag);
-    const m=document.createElement("div"); m.className="m"; m.textContent=`Sendt ${dk(inv.date)}, betales senest ${dk(inv.due)}`;
+    const d=document.createElement("div"); d.className="d"; d.textContent=`${inv.credit?"Kreditnota":"Nr."} ${inv.no}, ${inv.customer.name}`;
+    const st = inv.credit ? ["open","Krediterer nr. "+inv.credit] : inv.creditedBy ? ["open","Krediteret"] : inv.paid ? ["paid","Betalt"] : inv.due<now ? ["late","Over frist"] : ["open","Ubetalt"];
+    const tag=document.createElement("span"); tag.className="tag "+st[0]; tag.textContent=st[1]; d.appendChild(tag);
+    const m=document.createElement("div"); m.className="m";
+    m.textContent = inv.credit ? `Udstedt ${dk(inv.date)}` : inv.creditedBy ? `Sendt ${dk(inv.date)}, krediteret med kreditnota ${inv.creditedBy}` : `Sendt ${dk(inv.date)}, betales senest ${dk(inv.due)}`;
     left.append(d,m);
     const a=document.createElement("div"); a.className="a num"; a.textContent=money(t.total)+" kr.";
     top.append(left,a);
     const b=document.createElement("div"); b.className="btns";
     const pdf=document.createElement("button"); pdf.type="button"; pdf.className="ghost"; pdf.textContent="Hent PDF"; pdf.onclick=()=>invPdf(inv);
-    const paid=document.createElement("button"); paid.type="button"; paid.className="ghost"; paid.textContent=inv.paid?"Markér som ubetalt":"Markér som betalt";
-    paid.onclick=()=>{ inv.paid=!inv.paid; save(); renderInv(); };
-    const del=document.createElement("button"); del.type="button"; del.className="ghost"; del.textContent="Slet";
-    del.onclick=()=>{ if(confirm(`Slet faktura ${inv.no}? Indtægten fjernes også fra regnskabet.`)){ state.invoices=state.invoices.filter(x=>x.id!==inv.id); state.entries=state.entries.filter(x=>x.id!==inv.entryId); save(); render(); renderInv(); } };
-    b.append(pdf,paid,del);
+    b.append(pdf);
+    if(!inv.credit && !inv.creditedBy){
+      const paid=document.createElement("button"); paid.type="button"; paid.className="ghost"; paid.textContent=inv.paid?"Markér som ubetalt":"Markér som betalt";
+      paid.onclick=()=>{ inv.paid=!inv.paid; save(); renderInv(); };
+      const cr=document.createElement("button"); cr.type="button"; cr.className="ghost"; cr.textContent="Krediter";
+      armConfirm(cr, "Lav kreditnota?", ()=>creditInv(inv));
+      b.append(paid,cr);
+    }
+    // Kun det nyeste nummer må slettes, ellers opstår der huller i nummerrækken
+    if(inv.no===state.nextNo-1){
+      const del=document.createElement("button"); del.type="button"; del.className="ghost"; del.textContent="Slet";
+      armConfirm(del, "Tryk igen for at slette", ()=>{
+        state.invoices=state.invoices.filter(x=>x.id!==inv.id); state.entries=state.entries.filter(x=>x.id!==inv.entryId);
+        if(inv.credit){ const o=state.invoices.find(x=>x.no===inv.credit&&!x.credit); if(o) delete o.creditedBy; }
+        state.nextNo=inv.no; fillSettings(); save(); render(); renderInv(); });
+      b.append(del);
+    }
     li.append(top,b); ul.appendChild(li);
   });
 }
@@ -544,11 +593,11 @@ function invPdf(inv){
   doc.setFont("helvetica","bold"); doc.setFontSize(16); doc.text(c.name||"",L,24);
   doc.setFont("helvetica","normal"); doc.setFontSize(10);
   let y=30; [c.addr,c.city,c.cvr?"CVR-nr. "+c.cvr:"",c.email,c.phone?"Tlf. "+c.phone:""].filter(Boolean).forEach(x=>{ doc.text(x,L,y); y+=5; });
-  doc.setFont("helvetica","bold"); doc.setFontSize(22); doc.text("Faktura",R,24,{align:"right"});
+  doc.setFont("helvetica","bold"); doc.setFontSize(22); doc.text(inv.credit?"Kreditnota":"Faktura",R,24,{align:"right"});
   doc.setFont("helvetica","normal"); doc.setFontSize(10);
-  doc.text("Fakturanr. "+inv.no,R,31,{align:"right"});
-  doc.text("Fakturadato: "+dk(inv.date),R,36,{align:"right"});
-  doc.text("Betales senest: "+dk(inv.due),R,41,{align:"right"});
+  doc.text((inv.credit?"Kreditnotanr. ":"Fakturanr. ")+inv.no,R,31,{align:"right"});
+  doc.text("Dato: "+dk(inv.date),R,36,{align:"right"});
+  doc.text(inv.credit?"Krediterer faktura nr. "+inv.credit:"Betales senest: "+dk(inv.due),R,41,{align:"right"});
   y=Math.max(y,46)+10;
   doc.setFont("helvetica","bold"); doc.text("Faktureres til",L,y); doc.setFont("helvetica","normal"); y+=5;
   [inv.customer.name,inv.customer.addr,inv.customer.cvr?"CVR-nr. "+inv.customer.cvr:""].filter(Boolean).forEach(x=>{ doc.text(x,L,y); y+=5; });
@@ -571,7 +620,11 @@ function invPdf(inv){
   doc.text(inv.vat?"Moms 25 %":"Moms",110,y); doc.text(money(t.vat),R,y,{align:"right"}); y+=6;
   doc.setFont("helvetica","bold"); doc.text("I alt DKK",110,y); doc.text(money(t.total),R,y,{align:"right"}); doc.setFont("helvetica","normal");
   y+=14;
-  if(!inv.vat){ doc.text("Fakturaen er uden moms.",L,y); y+=6; }
+  if(!inv.vat){ doc.text(inv.credit?"Kreditnotaen er uden moms.":"Fakturaen er uden moms.",L,y); y+=6; }
+  if(inv.credit){
+    doc.text(`Kreditnotaen annullerer faktura nr. ${inv.credit}. Beløbet skal ikke betales.`,L,y);
+    saveFile(`kreditnota-${inv.no}.pdf`, doc.output("arraybuffer"), "application/pdf", "invListErr"); return;
+  }
   doc.setFont("helvetica","bold"); doc.text("Betaling",L,y); doc.setFont("helvetica","normal"); y+=5;
   if(c.reg||c.konto){ doc.text(`Reg.nr. ${c.reg||""}   Kontonr. ${c.konto||""}`,L,y); y+=5; }
   doc.text(`Betales senest ${dk(inv.due)}. Skriv fakturanr. ${inv.no} ved betaling.`,L,y);
@@ -594,7 +647,7 @@ function save(){
 
 // Opstart
 try{ const s=JSON.parse(localStorage.getItem(LS)||"null"); if(s) state=normalize(s); }catch(e){}
-$("fDate").value = new Date().toISOString().slice(0,10);
+$("fDate").value = today();
 $("quarter").value = String(Math.floor(new Date().getMonth()/3)+1);
 $("taxPct").value = String(state.taxPct).replace(".",",");
 fillYears();
@@ -619,6 +672,27 @@ $("rowFile").onchange=async()=>{
   $("saveState").textContent="Uploader kvittering…";
   try{ e.receipt=await uploadReceipt(f); save(); render(); }
   catch(err){ $("saveState").textContent=err.message; }
+};
+$("backupBtn").onclick=()=>{
+  $("backupErr").textContent="";
+  const data=new TextEncoder().encode(JSON.stringify({app:"regnskab", saved:new Date().toISOString(), ...state}, null, 1));
+  saveFile(`regnskab-backup-${today()}.json`, data, "application/json", "backupErr");
+};
+let restoreData=null;
+$("restoreBtn").onclick=()=>{
+  if(restoreData){ state=restoreData; restoreData=null; $("restoreBtn").textContent="Indlæs backup";
+    fillSettings(); fillYears(); save(); render(); renderInv(); $("backupErr").textContent="Backup indlæst."; return; }
+  $("restoreFile").value=""; $("restoreFile").click();
+};
+$("restoreFile").onchange=async()=>{
+  const f=$("restoreFile").files[0]; if(!f) return;
+  try{
+    const d=JSON.parse(await f.text());
+    if(!d||d.app!=="regnskab"||!Array.isArray(d.entries)) throw 0;
+    restoreData=normalize(d);
+    $("backupErr").textContent=`Backuppen har ${restoreData.entries.length} posteringer og ${restoreData.invoices.length} fakturaer. Den erstatter alt, der er her nu. Tryk "Erstat nu" for at fortsætte.`;
+    $("restoreBtn").textContent="Erstat nu";
+  }catch(e){ restoreData=null; $("backupErr").textContent="Filen er ikke en backup fra Mit regnskab."; }
 };
 $("year").onchange=render; $("quarter").onchange=render;
 $("taxPct").onchange=()=>{ const v=parseNum($("taxPct").value); if(v>=0&&v<100){ state.taxPct=v; save(); render(); } else { $("taxPct").value=String(state.taxPct).replace(".",","); } };
